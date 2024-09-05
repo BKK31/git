@@ -855,7 +855,7 @@ def index_read(repo):
         # Read creation time, as nanoseconds after that timestamps, for extra precision
         ctime_ns = int.from_bytes(content[idx+4:idx+8], "big")
         # Same for modification time from "epoch"
-        mtime_s = int.from_bytes(content[idx+8,idx+12], "big")
+        mtime_s = int.from_bytes(content[idx+8:idx+12], "big")
         # Then extra nanoseconds
         mtime_ns = int.from_bytes(content[idx+12:idx+16], "big")
         # Device ID
@@ -931,3 +931,258 @@ def index_read(repo):
                                      flag_stage=flag_stage,
                                      name=name))
     return GitIndex(version=version, entries=entries)
+
+argsp = argsubparsers.add_parser("ls-files", help="List all the stage files")
+argsp.add_argument("--verbose", action="store_true", help="Show everything")
+
+def cmd_ls_files(args):
+    repo = repo_find()
+    index = index_read(repo)
+    if args.verbose:
+        print("Index file format v{}, containing {} entries".format(index.version, len(index.entries)))
+        
+    for e in index.entries:
+        print(e.name)
+        if args.verbose:
+            print("  {} with perms: {:o}".format({
+                0b1000: "regular file",
+                0b1010: "symlink",
+                0b1110: "git link"}[e.mode_type],
+                e.mode_perms))
+            print("  on blob: {}".format(e.sha))
+            print("  created: {}.{}, modified: {}.{}".format(
+                datetime.fromtimestamp(e.ctime[0]),
+                e.ctime[1],
+                datetime.fromtimestamp(e.mtime[0]),
+                e.mtime[1]))
+            print("  device: {}, inode: {}".format(e.dev,e.ino))
+            print("  user: {} ({})  group: {} ({})".format(
+                pwd.getpwuid(e.uid).pw_name,
+                e.uid,
+                grp.getgrgid(e.gid).gr_name,
+                e.gid))
+            print("  flags: stage={} assume_valid={}".format(
+                e.flag_state,
+                e.flag_assume_valid))
+            
+    argsp = argsubparsers.add_parser("check-ignore", help="Check path(s) against ignore rules.")
+    argsp.add_argument("path", nargs="+", help="Paths to check")
+    
+def cmd_check_ignore(args):
+    repo = repo_find()
+    rules = gitignore_read(repo)
+    for path in args.path:
+        if check_ignore(rules, path):
+            print(path)
+                
+def gitignore_parse1(raw):
+    raw = raw.strip()
+    if not raw or raw[0] == "#":
+        return None
+    elif raw[0] == "!":
+        return (raw[1:], False)
+    elif raw[0] == "\\":
+        return (raw[1:], True)
+    else:
+        return (raw, True)
+    
+def gitignore_parse(lines):
+    ret = list()
+    for line in lines:
+        parsed = gitignore_parse1(line)
+        if parsed:
+            ret.append(parsed)
+    
+    return ret
+
+class GitIgnore(object):
+    absolute = None
+    scoped = None
+    
+    def __init__(self, absolute, scoped):
+        self.absolute = absolute
+        self.scoped = scoped
+
+def gitignore_read(repo):
+    ret = GitIgnore(absolute=list(), scoped=dict())
+    
+    # Read local configuration in .git/info/exclude
+    repo_file = os.path.join(repo.gitdir, "info/exclude")
+    if os.path.exists(repo_file):
+        with open(repo_file, "r") as f:
+            ret.absolute.append(gitignore_parse(f.readlines()))
+            
+    # Global configuration
+    if "XDG_CONFIG_HOME" in os.environ:
+        config_home = os.environ["XDG_CONFIG_HOME"]
+    else:
+        config_home = os.path.expanduser("~/.config")
+    global_file = os.path.join(config_home, "git/ignore")
+    
+    if os.path.exists(global_file):
+        with open(global_file, "r") as f:
+            ret.absolute.append(gitignore_parse(f.readlines()))
+            
+    # .gitignore files in the index
+    index = index_read(repo)
+    
+    for entry in index.entries:
+        if entry.name == ".gitignore" or entry.name.endswith("/.gitignore"):
+            dir_name = os.path.dirname(entry.name)
+            contents = object_read(repo, entry.sha)
+            lines = contents.blobdata.decode("utf8").splitlines()
+            ret.scoped[dir_name] = gitignore_parse(lines)
+    return ret
+
+def check_ignore1(rules, path):
+    result = None
+    for (pattern, value) in rules:
+        if fnmatch(path, pattern):
+            result = value
+    return result
+
+def check_ignore_scoped(rules, path):
+    parent = os.path.dirname(path)
+    while True:
+        if parent in rules:
+            result = check_ignore1(rules[parent], path)
+            if result != None:
+                return result
+        if parent == "":
+            break
+        parent = os.path.dirname(parent)
+    return None
+
+def check_ignore_absolute(rules, path):
+    parent = os.path.dirname(path)
+    for ruleset in rules:
+        result = check_ignore1(ruleset, path)
+        if result != None:
+            return result
+    return False # This is a reasonable default at this point
+
+def check_ignore(rules, path):
+    if os.path.isabs(path):
+        raise Exception("This function requires path to be relative to the repository's root")
+    result = check_ignore_scoped(rules.scoped, path)
+    if result != None:
+        return result
+    return check_ignore_absolute(rules.absolute, path)
+
+argsp = argsubparsers.add_parser("status", help="Show the working tree status.")
+
+def cmd_status(_):
+    repo = repo_find()
+    index = index_read(repo)
+    
+    cmd_status_branch(repo)
+    cmd_status_head_index(repo, index)
+    print()
+    cmd_status_index_worktree(repo, index)
+    
+def branch_get_active(repo):
+    with open(GitRepository.repo_file(repo, "HEAD"), "r") as f:
+        head = f.read()
+        
+    if head.startswith("ref: refs/heads/"):
+        return (head[16:-1])
+    else:
+        return False
+    
+def cmd_status_branch(repo):
+    branch = branch_get_active(repo)
+    if branch:
+        print("On branch {}.".format(branch))
+    else:
+        print("HEAD detached at {}".format(object_find(repo, "HEAD")))
+        
+def tree_to_dict(repo, ref, prefix=""):
+    ret = dict()
+    tree_sha = object_find(repo, ref, fmt=b'tree')
+    tree = object_read(repo, tree_sha)
+    
+    for leaf in tree.items:
+        full_path = os.path.join(prefix, leaf.path)
+        # We read the object to extract its type (this is uselessly
+        # expensive: we could just open it as a file and read the
+        # first few bytes)
+        is_subtree = leaf.mode.startswith(b'04')
+        
+        # Depending on the type, we either store the path (if it's a
+        # blob, so a regular file), or recurse (if it's another tree,
+        # so a subdir)
+        if is_subtree:
+            ret.update(tree_to_dict(repo, leaf.sha, full_path))
+        else:
+            ret[full_path] = leaf.sha
+            
+    return ret
+
+def cmd_status_head_index(repo, index):
+    print("Changes to be committed:")
+    head = tree_to_dict(repo, "HEAD")
+    for entry in index.entries:
+        if entry.name in head:
+            if head[entry.name] != entry.sha:
+                print("  modified:", entry.name)
+            del head[entry.name] # Delete the key
+        else:
+            print("  added:  ",entry.name)
+    # Keys still in HEAD are files that we haven't met in the index,
+    # and thus have been deleted.
+    for entry in head.keys():
+        print("  deleted:  ",entry)
+        
+def cmd_status_index_worktree(repo, index):
+    print("Changes not staged for commit:")
+    ignore = gitignore_read(repo)
+    
+    gitdir_prefix = repo.gitdir + os.path.sep
+    
+    all_files = list()
+    
+    # We begin by walking the filesystem
+    for(root, _, files) in os.walk(repo.worktree, True):
+        if root==repo.gitdir or root.startswith(gitdir_prefix):
+            continue
+        for f in files:
+            full_path = os.path.join(root, f)
+            rel_path = os.path.relpath(full_path, repo.worktree)
+            all_files.append(rel_path)
+            
+    # We now traverse the index, and compare real files with the cached
+    # versions.
+    for entry in index.entries:
+        full_path = os.path.join(repo.worktree, entry.name)
+        
+        # That file *name* is in the index
+        
+        if not os.path.exists(full_path):
+            print("  deleted:  ", entry.name)
+        else:
+            stat = os.stat(full_path)
+            
+            # Compare metadata
+            ctime_ns = entry.ctime[0] * 10**9 + entry.ctime[1]
+            mtime_ns = entry.mtime[0] * 10**9 + entry.mtime[1]
+            if (stat.st_ctime_ns != ctime_ns) or (stat.st_mtime_ns != mtime_ns):
+                # If different, deep compare.
+                # @FIXME This *will* crash on symlinks to dir.
+                with open(full_path,"rb") as fd:
+                    new_sha = object_hash(fd, b"blob", None)
+                    # If hashes are the same, the files are actually the same
+                    same = entry.sha == new_sha
+                    
+                    if not same:
+                        print("  modified: ", entry.name)
+        if entry.name in all_files:
+            all_files.remove(entry.name)
+    
+    print()
+    print("Untracked files:")
+    
+    for f in all_files:
+        # @TODO If a full directory is untracked, we should display
+        # its name without its contents.
+        if not check_ignore(ignore, f):
+            print(" ",f)
