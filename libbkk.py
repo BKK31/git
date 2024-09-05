@@ -1447,3 +1447,4 @@ def cmd_commit(args):
     else: # Otherwise we update HEAD itself
         with open(GitRepository.repo_file(repo, "HEAD"), "w") as fd:
             fd.write("\n")
+            
