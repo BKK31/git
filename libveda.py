@@ -484,12 +484,47 @@ def cmd_log(args):
     log_graphviz(repo, object_find(repo,args.commit), set())
     print("}")
     
+    # Print Commit Log Output (similar to git log)
+    print_commit_log(repo, object_find(repo, args.commit))
+
+def print_commit_log(repo, sha):
+    commit = object_read(repo, sha)
+    
+    # Ensure commit is valid
+    if commit is None:
+        print(f"Error: Could not find object for SHA {sha}")
+        return
+
+    short_hash = sha[0:8]
+    author = commit.kvlm[b'author'].decode("utf8").strip()
+    message = commit.kvlm[None].decode("utf8").strip()
+    date = commit.kvlm[b'author'].decode("utf8").split("> ")[1]
+
+    # Print the commit log in git log style
+    print(f"commit {sha}")
+    print(f"Author: {author}")
+    print(f"Date:   {date}")
+    print(f"\n    {message}\n")
+
+    # Recurse for parents
+    if b'parent' in commit.kvlm:
+        parents = commit.kvlm[b'parent']
+        if type(parents) != list:
+            parents = [parents]
+
+        for parent in parents:
+            print_commit_log(repo, parent.decode("utf8"))
+    
 def log_graphviz(repo, sha, seen):
     if sha in seen:
         return
     seen.add(sha)
     
     commit = object_read(repo, sha)
+    if commit is None:
+        print(f"Error: Could not read object for SHA {sha}")
+        return
+
     short_hash = sha[0:8]
     message = commit.kvlm[None].decode("utf8").strip()
     message = message.replace("\\", "\\\\")
@@ -508,12 +543,13 @@ def log_graphviz(repo, sha, seen):
     parents = commit.kvlm[b'parent']
     
     if type(parents) != list:
-        parents = [ parents ]
+        parents = [parents]
         
     for p in parents:
         p = p.decode("ascii")
         print("  c_{0} -> c_{1};".format(sha, p))
-        log_graphviz(repo, p, seen) 
+        log_graphviz(repo, p, seen)
+
         
 class GitTreeLeaf(object):
     def __init__(self,mode, path,sha):
